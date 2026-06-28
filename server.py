@@ -74,8 +74,8 @@ PORT = int(os.environ.get("ATOMCODE_PROXY_PORT", "8787"))
 AUTH_KEYS = {k.strip() for k in os.environ.get("ATOMCODE_PROXY_API_KEY", "").split(",") if k.strip()}
 # 子进程超时（秒）
 REQUEST_TIMEOUT = int(os.environ.get("ATOMCODE_PROXY_TIMEOUT", "600"))
-# 默认最大 LLM 回合数（对应 --max-turns）
-DEFAULT_MAX_TURNS = int(os.environ.get("ATOMCODE_MAX_TURNS", "3"))
+# 默认最大 LLM 回合数（对应 --max-turns）；聊天场景 1 即够，agent 循环纯属额外开销
+DEFAULT_MAX_TURNS = int(os.environ.get("ATOMCODE_MAX_TURNS", "1"))
 
 # === gcli2api 借鉴的四项增强 ===
 # 兼容性模式：把 system 消息转成 user 消息（某些客户端不认 system role）
@@ -84,11 +84,12 @@ COMPATIBILITY_MODE = os.environ.get("COMPATIBILITY_MODE", "false").lower() in ("
 RETRY_ENABLED = os.environ.get("RETRY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 RETRY_MAX = int(os.environ.get("RETRY_MAX", "3"))
 RETRY_INTERVAL = float(os.environ.get("RETRY_INTERVAL", "1.0"))
-# 流式抗截断：检测答案不完整 → 自动续写补全
-ANTI_TRUNCATION_ENABLED = os.environ.get("ANTI_TRUNCATION_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-ANTI_TRUNCATION_MAX_ATTEMPTS = int(os.environ.get("ANTI_TRUNCATION_MAX_ATTEMPTS", "3"))
+# 流式抗截断：检测答案不完整 → 自动续写补全。
+# 默认关：聊天回答大量不以句号结尾，启发式过激进会默默把延迟翻 2-4 倍。需要再开。
+ANTI_TRUNCATION_ENABLED = os.environ.get("ANTI_TRUNCATION_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+ANTI_TRUNCATION_MAX_ATTEMPTS = int(os.environ.get("ANTI_TRUNCATION_MAX_ATTEMPTS", "1"))
 # 答案完整性的粗略启发式：以这些标点结尾视为可能完整
-_COMPLETE_ENDINGS = ("。", "！", "？", ".", "!", "?", "```", ")", "）", "\n")
+_COMPLETE_ENDINGS = ("。", "！", "？", ".", "!", "?", "```", ")", "）")
 
 logging.basicConfig(
     level=os.environ.get("ATOMCODE_PROXY_LOG", "INFO"),
@@ -322,19 +323,18 @@ def _merge_continuation(prev: str, cont: str) -> str:
 
 async def _run_atomcode_stream(prompt: str, max_turns: int, workdir: str | None = None, provider: str | None = None) -> AsyncIterator[str]:
     """
-    流式版本：按行读取 atomcode stdout，每凑到一行就 yield 一段文本。
-    AtomCode 无头模式本身不增量输出（它是 agent 循环，最后才打印完整答案），
-    所以这里的 "流式" 实际是拿到完整答案后按行切片模拟流式，保证客户端 SSE 协议兼容。
-    抗截断：收集完整输出后若发现截断，先续写补全再切片输出。
+    流式版本：直接调一次 _run_atomcode_once 拿完整文本，再按行切片推送。
+    流式路径不走抗截断续写——续写会把延迟翻 2-4 倍，而流式用户能边看边出字，
+    尾部少几个字远没有"等更久"伤体验。抗截断只留给非流式（_run_atomcode）。
     """
-    # 先用非流式方式拿到完整（含抗截断）文本，再按行模拟流式推送
-    # 这是 AtomCode 无头模式的现实：它不会增量吐 token，只能整段拿
-    text = await _run_atomcode(prompt, max_turns, workdir, provider)
+    code, text, stderr = await _run_atomcode_once(prompt, max_turns, workdir, provider)
+    if code != 0:
+        log.warning("流式调用失败 exit=%d stderr=%s", code, stderr[-200:])
     # 按行推送，每行作为一个 chunk
-    lines = text.splitlines()
+    lines = text.splitlines() if text else []
     for line in lines:
         yield line
-    if not text.strip():
+    if not text or not text.strip():
         yield ""
 
 
@@ -512,7 +512,7 @@ async def chat_completions(
 
     messages, model, provider = _parse_messages(data)
     stream = bool(data.get("stream", False))
-    max_turns = DEFAULT_MAX_TURNS
+    max_turns = int(data.get("max_turns") or DEFAULT_MAX_TURNS)
     prompt = _messages_to_prompt(messages, max_turns)
     workdir = os.environ.get("ATOMCODE_WORKDIR")
 
@@ -562,7 +562,7 @@ async def claude_messages(
     messages, model, provider = _parse_messages(data)
     stream = bool(data.get("stream", False))
     req_id = data.get("id") or _gen_id("msg")
-    max_turns = DEFAULT_MAX_TURNS
+    max_turns = int(data.get("max_turns") or DEFAULT_MAX_TURNS)
     prompt = _messages_to_prompt(messages, max_turns)
     workdir = os.environ.get("ATOMCODE_WORKDIR")
 

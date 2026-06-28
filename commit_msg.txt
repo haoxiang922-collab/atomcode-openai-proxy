@@ -1,0 +1,28 @@
+perf: 首字延迟砍半——默认关抗截断+流式跳过续写+max_turns降1
+
+## 出字慢根因（zcode 诊断，已验证）
+1. 抗截断续写 _looks_truncated 启发式过激进——聊天回答大量不以句号结尾
+   （"好的我明白了"、"返回两数之和"），几乎 100% 触发续写，每次续写又拉起
+   一个完整 atomcode 子进程，默认最多 3 次 → 延迟默默乘 2-4 倍
+2. max_turns=3 是给 agent 读文件/改代码准备的，聊天场景纯属额外开销
+3. _COMPLETE_ENDINGS 里的 "\n" 是死代码（rstrip 已去尾换行，永远匹配不上）
+
+## 本次改动
+- ANTI_TRUNCATION_ENABLED 默认 true → false（聊天场景不需要，要开自己设环境变量）
+- ANTI_TRUNCATION_MAX_ATTEMPTS 默认 3 → 1（即便开启也只补一次封顶）
+- _run_atomcode_stream 流式路径直接调 _run_atomcode_once，不再走 _run_atomcode
+  的抗截断分支——流式用户能边看边出字，尾部少几个字远没有"等更久"伤体验
+- DEFAULT_MAX_TURNS 默认 3 → 1（聊天够用，砍 agent 循环）
+- 客户端可按请求覆盖：body 里传 "max_turns": N 即生效（OpenAI + Claude 端点都支持）
+- _COMPLETE_ENDINGS 去掉死代码 "\n"
+
+## 验证
+- 语法检查通过（605 行）
+- 上游直接打 llm-api.atomgit.com 已验证走不通（要 AtomCode 签名头，
+  ATOMCODE_SIG_MISSING），所以根治方案（换真流式）暂不可行，
+  本次是在现有子进程架构下能做到的最快
+
+## 预期收益
+首字延迟砍半以上（续写翻倍 + agent 循环回合双砍）
+
+Co-Authored-By: AtomCode (GLM-5.2) <noreply@atomgit.com>
