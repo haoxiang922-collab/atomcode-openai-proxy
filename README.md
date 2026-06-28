@@ -12,16 +12,17 @@
    │  POST /v1/messages           (Claude 格式)
    ▼
 本服务 (FastAPI, 默认 0.0.0.0:8787)
-   │  子进程: atomcode -p "<拼好的 prompt>" --max-turns N -y --no-telemetry
+   │  prompt 写入临时文件 → atomcode --prompt-file <file> --provider <model> --max-turns N -y --no-telemetry
+   │  （用 --prompt-file 绕开 Windows 命令行 32767 字符硬限制，支持酒馆长上下文）
    │  + 429/5xx 自动重试 + 流式抗截断续写
    ▼
-AtomCode CLI  →  GLM-5.2 (走你已登录的 AtomGit CodingPlan 额度)
+AtomCode CLI  →  GLM-5.2 / deepseek-v4-flash / qwen3-vl-8b-instruct (走你已登录的 AtomGit CodingPlan 额度)
    │  stdout 纯文本答案
    ▼
 包装成 OpenAI ChatCompletion / Claude Message / SSE 流式响应 → 返回客户端
 ```
 
-AtomCode 的 `daemon` 模式（端口 13456）只给 IDE 插件用，不暴露 LLM 端点，所以这里走 **`atomcode -p` 无头子进程**模式——这是官方确认的非交互入口。
+AtomCode 的 `daemon` 模式（端口 13456）只给 IDE 插件用，不暴露 LLM 端点，所以这里走 **`atomcode --prompt-file` 无头子进程**模式——这是官方确认的非交互入口。用临时文件传 prompt 而非 `-p` 命令行参数，是为了绕开 Windows `CreateProcessW` 的 32767 字符命令行硬限制（酒馆角色卡+世界书+长对话很容易超这个限制报 `WinError 206`）。
 
 ## 前置要求
 
@@ -49,8 +50,20 @@ python server.py
 |------|------|------|
 | `POST /v1/chat/completions` | OpenAI | 标准 ChatCompletion，支持流式/非流式 |
 | `POST /v1/messages` | Claude | Anthropic Message 协议，支持顶层 system、x-api-key 头、流式事件 |
-| `GET /v1/models` | OpenAI | 模型列表 |
+| `GET /v1/models` | OpenAI | 模型列表（含三个模型 + 上下文窗口） |
 | `GET /health` | — | 健康检查 + 功能开关状态 |
+
+## 支持的模型
+
+客户端在 `model` 字段填对应名字即可切换，反代会通过 `--provider` 调对应后端：
+
+| model 名 | 实际模型 | 上下文窗口 | 用途 |
+|---|---|---|---|
+| `glm-5.2` | GLM-5.2 | 200K | 默认，编程强 |
+| `deepseek-v4-flash` | deepseek-v4-flash | **1M** | 长上下文（百万 token） |
+| `qwen3-vl-8b-instruct` | Qwen3-VL-8B-Instruct | 64K | 视觉模型 |
+
+三个模型都走 AtomGit CodingPlan 额度，无需额外配置。`deepseek-v4-flash` 的 1M 上下文是 CodingPlan Pro 原生支持，不用任何特殊操作。
 
 ## 客户端配置示例
 
@@ -58,18 +71,18 @@ python server.py
 - API 类型：**Chat Completion (OpenAI)**
 - 自定义端点：`http://127.0.0.1:8787/v1`
 - API Key：随便填（未启用鉴权时）；启用鉴权则填你设的 key
-- 模型：`glm-5.2`
+- 模型：`glm-5.2` / `deepseek-v4-flash` / `qwen3-vl-8b-instruct`（三选一，见上表）
 
 ### Hermes / Cherry Studio / NextChat（OpenAI 格式）
 - API Base URL：`http://127.0.0.1:8787/v1`
 - API Key：同上
-- 模型名：`glm-5.2`
+- 模型名：同上
 
 ### Claude 协议客户端
 - API Base URL：`http://127.0.0.1:8787`
 - 端点：`/v1/messages`
 - 认证头：`x-api-key: <你的key>` 或 `Authorization: Bearer <你的key>`
-- 模型名：`glm-5.2`
+- 模型名：同上
 
 ## 四项增强功能（借鉴自 gcli2api）
 

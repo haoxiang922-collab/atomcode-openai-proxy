@@ -47,6 +47,27 @@ from sse_starlette.sse import EventSourceResponse
 
 ATOMCODE_BIN = os.environ.get("ATOMCODE_BIN", "atomcode")
 DEFAULT_MODEL = os.environ.get("ATOMCODE_MODEL", "glm-5.2")
+
+# 客户端 model 名 → AtomCode provider 名（来自 ~/.atomcode/config.toml）
+# provider 决定了真实模型 + 上下文窗口；CodingPlan Pro 三档全开
+MODEL_PROVIDER_MAP = {
+    "glm-5.2":                "AtomGit-GLM-5.2",
+    "deepseek-v4-flash":      "AtomGit-deepseek-v4-flash",
+    "qwen3-vl-8b-instruct":   "AtomGit-Qwen-Qwen3-VL-8B-Instruct",
+}
+# 模型元信息（用于 /v1/models 端点展示）
+MODEL_META = [
+    {"id": "glm-5.2",              "context": 200000, "provider": "AtomGit-GLM-5.2"},
+    {"id": "deepseek-v4-flash",    "context": 1000000, "provider": "AtomGit-deepseek-v4-flash"},
+    {"id": "qwen3-vl-8b-instruct", "context": 64000,  "provider": "AtomGit-Qwen-Qwen3-VL-8B-Instruct"},
+]
+
+
+def _resolve_provider(model_name: str | None) -> str | None:
+    """客户端 model 名 → provider 名；找不到则返回 None（用 CLI 默认）。"""
+    if not model_name:
+        return None
+    return MODEL_PROVIDER_MAP.get(model_name.strip().lower())
 HOST = os.environ.get("ATOMCODE_PROXY_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ATOMCODE_PROXY_PORT", "8787"))
 # 可选鉴权：设了才校验（逗号分隔多个有效 key）；不设则放行（仅本地用）
@@ -156,43 +177,58 @@ def _looks_truncated(text: str) -> bool:
     return not tail.endswith(_COMPLETE_ENDINGS)
 
 
-async def _run_atomcode_once(prompt: str, max_turns: int, workdir: str | None = None) -> tuple[int, str, str]:
+async def _run_atomcode_once(prompt: str, max_turns: int, workdir: str | None = None, provider: str | None = None) -> tuple[int, str, str]:
     """
     单次调用 atomcode -p 子进程，返回 (退出码, stdout 清洗文本, stderr)。
     不含重试逻辑，由上层 _run_atomcode 统一重试。
+    provider 指定时加 --provider 切换 AtomCode 后端模型。
+    prompt 写入临时文件用 --prompt-file 传，绕开 Windows 命令行 32767 字符硬限制。
     """
-    cmd = [
-        ATOMCODE_BIN,
-        "-p", prompt,
-        "--max-turns", str(max_turns),
-        "-y",                 # 跳过所有权限提示（无头模式必须）
-        "--no-telemetry",
-    ]
-    if workdir:
-        cmd += ["-C", workdir]
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        stdin=asyncio.subprocess.DEVNULL,   # 避免 "不支持输入重新定向" 报错
-    )
+    import tempfile
+    # 写临时文件，UTF-8 编码，避免命令行长度限制 (WinError 206)
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".txt", prefix="atomcode_prompt_")
     try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=REQUEST_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise HTTPException(504, f"atomcode 子进程超时 ({REQUEST_TIMEOUT}s)")
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            f.write(prompt)
+        cmd = [
+            ATOMCODE_BIN,
+            "--prompt-file", tmp_path,
+            "--max-turns", str(max_turns),
+            "-y",                 # 跳过所有权限提示（无头模式必须）
+            "--no-telemetry",
+        ]
+        if provider:
+            cmd += ["--provider", provider]
+        if workdir:
+            cmd += ["-C", workdir]
 
-    stdout = stdout_bytes.decode("utf-8", errors="replace")
-    stderr = stderr_bytes.decode("utf-8", errors="replace")
-    # 过滤噪声行
-    lines = [_filter_noise(l) for l in stdout.splitlines()]
-    lines = [l for l in lines if l is not None]
-    cleaned = "\n".join(lines).strip()
-    return proc.returncode or 0, cleaned, stderr
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,   # 避免 "不支持输入重新定向" 报错
+        )
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=REQUEST_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise HTTPException(504, f"atomcode 子进程超时 ({REQUEST_TIMEOUT}s)")
+
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        # 过滤噪声行
+        lines = [_filter_noise(l) for l in stdout.splitlines()]
+        lines = [l for l in lines if l is not None]
+        cleaned = "\n".join(lines).strip()
+        return proc.returncode or 0, cleaned, stderr
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def _is_retryable(code: int, stderr: str) -> bool:
@@ -206,7 +242,7 @@ def _is_retryable(code: int, stderr: str) -> bool:
                                 "internal error", "unavailable", "timeout"))
 
 
-async def _run_atomcode(prompt: str, max_turns: int, workdir: str | None = None) -> str:
+async def _run_atomcode(prompt: str, max_turns: int, workdir: str | None = None, provider: str | None = None) -> str:
     """
     调用 atomcode -p，带 429/5xx 自动重试 + 流式抗截断续写。
     非流式：等子进程跑完一次性返回完整文本。
@@ -216,11 +252,11 @@ async def _run_atomcode(prompt: str, max_turns: int, workdir: str | None = None)
     # 第一阶段：重试拿到至少一次成功输出
     for attempt in range(1, RETRY_MAX + 1 if RETRY_ENABLED else 1):
         t0 = time.time()
-        code, text, stderr = await _run_atomcode_once(prompt, max_turns, workdir)
+        code, text, stderr = await _run_atomcode_once(prompt, max_turns, workdir, provider)
         log.info("atomcode 尝试 %d/%d 退出码=%d 耗时=%.1fs stdout=%dB",
                  attempt, RETRY_MAX if RETRY_ENABLED else 1, code, time.time() - t0, len(text))
-        if code == 0 and text:
-            break
+        if code == 0:
+            break  # exit 0 即成功，即使 stdout 为空（某些模型如视觉模型对纯文本 prompt 可能无输出）
         last_err = stderr[-500:] or f"exit {code}"
         if not RETRY_ENABLED or not _is_retryable(code, stderr):
             raise HTTPException(502, f"atomcode 失败 (exit {code}): {last_err}")
@@ -233,12 +269,12 @@ async def _run_atomcode(prompt: str, max_turns: int, workdir: str | None = None)
 
     # 第二阶段：流式抗截断 —— 答案看起来被截断则续写补全
     if ANTI_TRUNCATION_ENABLED and _looks_truncated(text):
-        text = await _anti_truncation_continue(prompt, text, max_turns, workdir)
+        text = await _anti_truncation_continue(prompt, text, max_turns, workdir, provider)
 
     return text
 
 
-async def _anti_truncation_continue(original_prompt: str, partial: str, max_turns: int, workdir: str | None) -> str:
+async def _anti_truncation_continue(original_prompt: str, partial: str, max_turns: int, workdir: str | None, provider: str | None = None) -> str:
     """
     抗截断：检测到 partial 不完整时，让 AtomCode 在 partial 基础上继续写完。
     最多续写 ANTI_TRUNCATION_MAX_ATTEMPTS 次，每次把已生成内容作为上下文喂回去。
@@ -255,7 +291,7 @@ async def _anti_truncation_continue(original_prompt: str, partial: str, max_turn
             f"【请继续补完整上述内容，只输出续写部分】"
         )
         try:
-            code, continuation, stderr = await _run_atomcode_once(continue_prompt, max_turns, workdir)
+            code, continuation, stderr = await _run_atomcode_once(continue_prompt, max_turns, workdir, provider)
         except HTTPException:
             break  # 超时等错误不再续写，保留已有内容
         if code != 0 or not continuation:
@@ -284,7 +320,7 @@ def _merge_continuation(prev: str, cont: str) -> str:
     return prev + cont[overlap:]
 
 
-async def _run_atomcode_stream(prompt: str, max_turns: int, workdir: str | None = None) -> AsyncIterator[str]:
+async def _run_atomcode_stream(prompt: str, max_turns: int, workdir: str | None = None, provider: str | None = None) -> AsyncIterator[str]:
     """
     流式版本：按行读取 atomcode stdout，每凑到一行就 yield 一段文本。
     AtomCode 无头模式本身不增量输出（它是 agent 循环，最后才打印完整答案），
@@ -293,7 +329,7 @@ async def _run_atomcode_stream(prompt: str, max_turns: int, workdir: str | None 
     """
     # 先用非流式方式拿到完整（含抗截断）文本，再按行模拟流式推送
     # 这是 AtomCode 无头模式的现实：它不会增量吐 token，只能整段拿
-    text = await _run_atomcode(prompt, max_turns, workdir)
+    text = await _run_atomcode(prompt, max_turns, workdir, provider)
     # 按行推送，每行作为一个 chunk
     lines = text.splitlines()
     for line in lines:
@@ -405,9 +441,9 @@ def _check_auth(authorization: str | None, x_api_key: str | None = None) -> None
         raise HTTPException(401, "invalid or missing api key")
 
 
-def _parse_messages(data: dict) -> tuple[list[ChatMessage], str]:
+def _parse_messages(data: dict) -> tuple[list[ChatMessage], str, str | None]:
     """
-    从请求体解析出 messages 列表和模型名。
+    从请求体解析出 messages 列表、模型名、provider 名。
     同时兼容 OpenAI 格式 (messages) 和 Claude 格式 (messages + 顶层 system)。
     """
     model = data.get("model", DEFAULT_MODEL)
@@ -429,7 +465,8 @@ def _parse_messages(data: dict) -> tuple[list[ChatMessage], str]:
             sys_text = str(sys_field)
         if sys_text.strip():
             messages.insert(0, ChatMessage(role="system", content=sys_text))
-    return messages, model
+    provider = _resolve_provider(model)
+    return messages, model, provider
 
 
 @app.get("/health")
@@ -446,10 +483,14 @@ async def list_models(authorization: str | None = Header(default=None)):
     _check_auth(authorization)
     return {
         "object": "list",
-        "data": [{
-            "id": DEFAULT_MODEL, "object": "model",
-            "created": _now(), "owned_by": "atomcode",
-        }],
+        "data": [
+            {
+                "id": m["id"], "object": "model",
+                "created": _now(), "owned_by": "atomcode",
+                "context_window": m["context"],
+            }
+            for m in MODEL_META
+        ],
     }
 
 
@@ -469,20 +510,26 @@ async def chat_completions(
     if not isinstance(data, dict):
         raise HTTPException(400, "body must be a JSON object")
 
-    messages, model = _parse_messages(data)
+    messages, model, provider = _parse_messages(data)
     stream = bool(data.get("stream", False))
     max_turns = DEFAULT_MAX_TURNS
     prompt = _messages_to_prompt(messages, max_turns)
     workdir = os.environ.get("ATOMCODE_WORKDIR")
 
     if not stream:
-        text = await _run_atomcode(prompt, max_turns, workdir)
-        return JSONResponse(_build_openai_full(text, model))
+        try:
+            text = await _run_atomcode(prompt, max_turns, workdir, provider)
+            return JSONResponse(_build_openai_full(text, model))
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.exception("非流式生成失败")
+            raise HTTPException(500, f"proxy error: {e}")
 
     async def event_gen():
         try:
             yield {"data": json.dumps(_build_openai_chunk("", model))}
-            async for piece in _run_atomcode_stream(prompt, max_turns, workdir):
+            async for piece in _run_atomcode_stream(prompt, max_turns, workdir, provider):
                 if piece:
                     yield {"data": json.dumps(_build_openai_chunk(piece + "\n", model))}
             yield {"data": json.dumps(_build_openai_chunk("", model, finish="stop"))}
@@ -512,7 +559,7 @@ async def claude_messages(
     if not isinstance(data, dict):
         raise HTTPException(400, "body must be a JSON object")
 
-    messages, model = _parse_messages(data)
+    messages, model, provider = _parse_messages(data)
     stream = bool(data.get("stream", False))
     req_id = data.get("id") or _gen_id("msg")
     max_turns = DEFAULT_MAX_TURNS
@@ -520,12 +567,12 @@ async def claude_messages(
     workdir = os.environ.get("ATOMCODE_WORKDIR")
 
     if not stream:
-        text = await _run_atomcode(prompt, max_turns, workdir)
+        text = await _run_atomcode(prompt, max_turns, workdir, provider)
         return JSONResponse(_build_claude_full(text, model, req_id))
 
     async def event_gen():
         try:
-            text = await _run_atomcode(prompt, max_turns, workdir)
+            text = await _run_atomcode(prompt, max_turns, workdir, provider)
             for evt in _build_claude_stream_events(text, model, req_id):
                 yield {"data": json.dumps(evt)}
         except Exception as e:
